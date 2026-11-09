@@ -186,6 +186,15 @@ type Download struct {
 	dataKey []byte
 }
 
+// Check reports whether id could be downloaded right now without taking a
+// slot: nil, or one of the errors Open would return.
+func (s *Store) Check(ctx context.Context, id string) error {
+	if !fileid.Valid(id) {
+		return db.ErrNotFound
+	}
+	return s.db.CheckAvailable(ctx, id, s.now())
+}
+
 // Open takes a download slot for id and prepares to decrypt it. Errors from
 // db.AcquireSlot (ErrNotFound, ErrExpired, ErrGone, ErrBusy) pass through.
 func (s *Store) Open(ctx context.Context, id string) (_ *Download, err error) {

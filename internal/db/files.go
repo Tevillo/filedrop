@@ -176,20 +176,43 @@ func (d *DB) AcquireSlot(ctx context.Context, id string, now time.Time) (File, e
 		return File{}, fmt.Errorf("acquire slot: %w", err)
 	}
 
-	// Nothing changed: work out why. Expiry is checked before the lock so an
-	// expired file reports "gone" rather than "busy".
+	// Nothing changed: work out why.
 	cur, err := d.GetFile(ctx, id)
-	switch {
-	case err != nil:
+	if err != nil {
 		return File{}, err
-	case cur.Status == StatusPending:
-		return File{}, ErrNotFound
-	case !cur.ExpiresAt.After(now):
-		return File{}, ErrExpired
-	case cur.Status == StatusDeleted, cur.RemainingDownloads == 0:
-		return File{}, ErrGone
+	}
+	if err := unavailable(cur, now); err != nil {
+		return File{}, err
+	}
+	return File{}, ErrBusy // a slot was taken between the UPDATE and the read
+}
+
+// CheckAvailable reports whether a download of id could start right now,
+// without taking a slot. It returns nil or the error AcquireSlot would give.
+// The answer can change a moment later; only AcquireSlot reserves anything.
+func (d *DB) CheckAvailable(ctx context.Context, id string, now time.Time) error {
+	f, err := d.GetFile(ctx, id)
+	if err != nil {
+		return err
+	}
+	return unavailable(f, now)
+}
+
+// unavailable explains why f can't be downloaded at now, or returns nil if a
+// slot is free. Expiry is checked before the lock so an expired file reports
+// "gone" rather than "busy".
+func unavailable(f File, now time.Time) error {
+	switch {
+	case f.Status == StatusPending:
+		return ErrNotFound
+	case !f.ExpiresAt.After(now):
+		return ErrExpired
+	case f.Status == StatusDeleted, f.RemainingDownloads == 0:
+		return ErrGone
+	case f.Locked, f.RemainingDownloads != Unlimited && f.CurrentDownloads >= f.RemainingDownloads:
+		return ErrBusy
 	default:
-		return File{}, ErrBusy
+		return nil
 	}
 }
 

@@ -1,15 +1,19 @@
 // Package httpapi is the HTTP interface:
 //
 //	PUT /filedrop/{name}   upload (API key required); the body is the file
-//	GET /filedrop/{id}     download via a share link (no key needed)
+//	GET /filedrop/{id}     share link: a small page whose script starts the download
+//	GET /filedrop/{id}?raw the file itself (no key needed; uses up a download)
 //
 // Uploads are the raw request body, so Content-Length is the declared size
 // used to reserve storage before any byte is read.
 package httpapi
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"log/slog"
 	"mime"
@@ -247,6 +251,10 @@ func (s *stallReader) Read(p []byte) (int, error) {
 
 // ---- download ----
 
+// download serves a share link. Without ?raw it returns a page, which is safe
+// for link-preview bots to fetch: it only reads the file's status. The page's
+// script then requests ?raw, which streams the file and uses up a download.
+// Bots don't run the script, so they never reach ?raw.
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 	// Go's GET routes also match HEAD. A HEAD must not use up a download.
 	if r.Method == http.MethodHead {
@@ -254,26 +262,121 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusMethodNotAllowed, "use GET to download")
 		return
 	}
+	raw := false
+	for k, vs := range r.URL.Query() {
+		if k != "raw" || len(vs) != 1 {
+			fail(w, http.StatusBadRequest, "the only allowed query is ?raw")
+			return
+		}
+		raw = true
+	}
+	if raw {
+		s.rawDownload(w, r)
+	} else {
+		s.downloadPage(w, r)
+	}
+}
+
+// unavailableStatus maps a "can't download" error to a status code and
+// message, or returns 0 for an unexpected error.
+func unavailableStatus(err error) (int, string) {
+	switch {
+	case errors.Is(err, db.ErrNotFound):
+		return http.StatusNotFound, "no such file"
+	case errors.Is(err, db.ErrExpired):
+		return http.StatusGone, "this link has expired"
+	case errors.Is(err, db.ErrGone):
+		return http.StatusGone, "this file has been deleted or has no downloads left"
+	case errors.Is(err, db.ErrBusy):
+		return http.StatusConflict, "this file is being downloaded right now; try again later"
+	default:
+		return 0, ""
+	}
+}
+
+// pageScript starts the real download. "?raw" is relative to the current URL,
+// so the file ID never appears in the page. The browser saves the response
+// as an attachment and keeps this page open.
+const pageScript = `document.getElementById("msg").textContent = "Download started. Check your downloads.";
+location.href = "?raw";`
+
+const pageStyle = `body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.5}`
+
+// pageCSP allows only the exact script and style above, by hash.
+var pageCSP = func() string {
+	hash := func(s string) string {
+		h := sha256.Sum256([]byte(s))
+		return "'sha256-" + base64.StdEncoding.EncodeToString(h[:]) + "'"
+	}
+	return "default-src 'none'; script-src " + hash(pageScript) + "; style-src " + hash(pageStyle) +
+		"; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+}()
+
+// The page never contains the file name: preview bots read the page, and the
+// title and text would end up in the chat app's preview.
+var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>File download</title>
+<style>{{.Style}}</style>
+</head>
+<body>
+<p id="msg">{{.Message}}</p>
+{{if .Start}}<script>{{.Script}}</script>
+<noscript><p>Turn on JavaScript to download, or add ?raw to the end of the link.</p></noscript>{{end}}
+</body>
+</html>
+`))
+
+// downloadPage shows the file's status and, if it's downloadable, starts the
+// download. It never takes a slot.
+func (s *Server) downloadPage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	code, msg, start := http.StatusOK, "Starting your download…", true
+	if err := s.store.Check(r.Context(), id); err != nil {
+		code, msg = unavailableStatus(err)
+		if code == 0 {
+			s.log.Error("download check failed", "file", short(id), "err", err)
+			code, msg = http.StatusInternalServerError, "could not open file"
+		}
+		msg = strings.ToUpper(msg[:1]) + msg[1:] + "."
+		start = false
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Content-Security-Policy", pageCSP)
+	h.Set("Cache-Control", "no-store")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "no-referrer") // the URL is the secret
+	h.Set("X-Robots-Tag", "noindex, nofollow")
+	if code == http.StatusConflict {
+		h.Set("Retry-After", "60")
+	}
+	w.WriteHeader(code)
+	pageTmpl.Execute(w, struct {
+		Message       string
+		Start         bool
+		Script, Style any
+	}{msg, start, template.JS(pageScript), template.CSS(pageStyle)})
+}
+
+// rawDownload streams the file, using up one download on success.
+func (s *Server) rawDownload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	dl, err := s.store.Open(r.Context(), id)
-	switch {
-	case err == nil:
-	case errors.Is(err, db.ErrNotFound):
-		fail(w, http.StatusNotFound, "no such file")
-		return
-	case errors.Is(err, db.ErrExpired):
-		fail(w, http.StatusGone, "this link has expired")
-		return
-	case errors.Is(err, db.ErrGone):
-		fail(w, http.StatusGone, "this file has been deleted or has no downloads left")
-		return
-	case errors.Is(err, db.ErrBusy):
-		w.Header().Set("Retry-After", "60")
-		fail(w, http.StatusConflict, "this file is being downloaded right now; try again later")
-		return
-	default:
-		s.log.Error("download open failed", "file", short(id), "err", err)
-		fail(w, http.StatusInternalServerError, "could not open file")
+	if err != nil {
+		code, msg := unavailableStatus(err)
+		if code == 0 {
+			s.log.Error("download open failed", "file", short(id), "err", err)
+			code, msg = http.StatusInternalServerError, "could not open file"
+		}
+		if code == http.StatusConflict {
+			w.Header().Set("Retry-After", "60")
+		}
+		fail(w, code, msg)
 		return
 	}
 

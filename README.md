@@ -58,7 +58,7 @@ In another terminal:
 
 ```sh
 LINK=$(curl -fsS -T notes.txt -H "Authorization: Bearer $KEY" http://127.0.0.1:8090/filedrop/)
-curl -OJ "$LINK"
+curl -OJ "$LINK?raw"
 ```
 
 ## Uploading and downloading
@@ -101,33 +101,44 @@ silently using the default.
 
 ### Download
 
-Anyone with the link can download; no key is needed:
+Anyone with the link can download; no key is needed.
+
+**In a browser**, open the link. A small page loads and its script starts the
+download right away; there's no button to click. If the file can't be
+downloaded (expired, used up, busy), the page says why instead. The page never
+shows the file name.
+
+**With curl**, add `?raw` to get the file itself:
 
 ```sh
-curl -OJ https://example.com/filedrop/lLwqZ6_kBjVaTSUo0ww8mA
+curl -OJ "https://example.com/filedrop/lLwqZ6_kBjVaTSUo0ww8mA?raw"
 ```
 
-`-O -J` saves the file under its original name.
+`-O -J` saves the file under its original name. Without `?raw`, curl gets the
+HTML page. Any other query (`?Raw`, `?raw&x=1`) is rejected with `400`.
 
 - Each successful download uses one of the file's downloads; a download that
   fails partway doesn't.
 - While all remaining downloads are in progress at once, further requests get
   `409`.
-- `HEAD` requests are refused so they can't use up a download.
+- Loading the page never uses a download; only `?raw` does.
+- `HEAD` requests are refused.
 - A transfer (upload or download) that makes no progress for 60 seconds is cut
   off. A cut-off upload leaves nothing behind.
 
-**Link previews:** chat apps often fetch pasted links to build a preview, and
-that fetch counts as a download. Share links where that won't happen, or allow
-more than one download.
+**Link previews:** chat apps (Discord, Slack, iMessage…) fetch pasted links to
+build a preview. They get the page, which uses nothing up, and they don't run
+its script, so they never reach `?raw`. Link scanners that *do* run JavaScript
+(some email and antivirus scanners) can still use up a download; allow more
+than one download if a link goes through one.
 
 ### Responses
 
 | Status | Meaning |
 | --- | --- |
 | `201` | Uploaded; the body is the share link |
-| `200` | Download follows |
-| `400` | Invalid setting, file name, or the upload didn't complete |
+| `200` | Download page, or the file itself with `?raw` |
+| `400` | Invalid setting, file name or download query, or the upload didn't complete |
 | `401` | Missing, unknown or revoked API key |
 | `404` | No such file (or no file name in the upload URL) |
 | `405` | Wrong method, e.g. `HEAD` on a link |
@@ -137,7 +148,8 @@ more than one download.
 | `413` | Larger than `FILEDROP_MAX_FILE_BYTES` |
 | `507` | Total storage (`FILEDROP_MAX_TOTAL_BYTES`) is full |
 
-Errors are a single line of text starting with `error:`.
+Errors are a single line of text starting with `error:`, except on the download
+page, which shows them as a sentence in the page.
 
 ## Administration
 
@@ -397,10 +409,10 @@ LINK=$(curl -fsS -T big.bin -H "Authorization: Bearer $KEY" https://example.com/
 echo "$LINK"
 
 # Download: the hash must match the one above
-curl -fsS -o got.bin "$LINK" && sha256sum got.bin
+curl -fsS -o got.bin "$LINK?raw" && sha256sum got.bin
 
 # Second download of a 1-download file: expect 410
-curl -s -o /dev/null -w '%{http_code}\n' "$LINK"
+curl -s -o /dev/null -w '%{http_code}\n' "$LINK?raw"
 
 # Wrong key: expect 401
 echo hi > small.txt
@@ -459,4 +471,4 @@ export FILEDROP_DATA_DIR=/tmp/filedrop-test/files
   it.
 - **Server-side encryption, not end-to-end.** Anyone with a shell on the server
   as the `filedrop` user (or root) can read the master key and decrypt files.
-- **Link previews count as downloads** (see [Download](#download)).
+- **Link scanners that run JavaScript can use up downloads** (see [Download](#download)).

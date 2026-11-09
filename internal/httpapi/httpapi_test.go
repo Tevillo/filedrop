@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -120,9 +123,21 @@ func (e *env) upload(name, query string, body []byte) string {
 	return id
 }
 
+// get fetches the file itself (?raw), as curl or the page's script does.
 func (e *env) get(id string) *http.Response {
 	e.t.Helper()
-	resp, err := http.Get(e.ts.URL + "/filedrop/" + id)
+	return e.fetch(id + "?raw")
+}
+
+// page fetches the share link exactly as shared, as a browser or bot does.
+func (e *env) page(id string) *http.Response {
+	e.t.Helper()
+	return e.fetch(id)
+}
+
+func (e *env) fetch(pathAndQuery string) *http.Response {
+	e.t.Helper()
+	resp, err := http.Get(e.ts.URL + "/filedrop/" + pathAndQuery)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -384,6 +399,115 @@ func TestContentDisposition(t *testing.T) {
 	for in, want := range tests {
 		if got := contentDisposition(in); got != want {
 			t.Errorf("contentDisposition(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Fetching the share link (what a preview bot does) never uses a download;
+// only ?raw does.
+func TestPageDoesNotUseDownload(t *testing.T) {
+	e := setup(t, big)
+	id := e.upload("secret-name.txt", "downloads=1", []byte("hello"))
+
+	for range 3 {
+		resp := e.page(id)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("page: %d", resp.StatusCode)
+		}
+		if !strings.Contains(string(body), `location.href = "?raw"`) {
+			t.Fatalf("page doesn't start the download:\n%s", body)
+		}
+		if strings.Contains(string(body), "secret-name") || strings.Contains(string(body), id) {
+			t.Fatalf("page leaks the file name or id:\n%s", body)
+		}
+	}
+	if got := status(t, e.get(id)); got != http.StatusOK {
+		t.Fatalf("raw after page views: %d, want 200", got)
+	}
+	if got := status(t, e.get(id)); got != http.StatusGone {
+		t.Fatalf("second raw: %d, want 410", got)
+	}
+}
+
+// The page reports why a file can't be downloaded, with a matching status,
+// and doesn't try to start the download.
+func TestPageErrors(t *testing.T) {
+	e := setup(t, big)
+	id := e.upload("a.txt", "downloads=1", []byte("hello"))
+
+	check := func(name, path string, want int, text string) {
+		t.Helper()
+		resp := e.fetch(path)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Fatalf("%s: %d, want %d", name, resp.StatusCode, want)
+		}
+		if strings.Contains(string(body), "<script>") {
+			t.Fatalf("%s: page still starts the download", name)
+		}
+		if !strings.Contains(string(body), text) {
+			t.Fatalf("%s: body missing %q:\n%s", name, text, body)
+		}
+	}
+	check("unknown", "AAAAAAAAAAAAAAAAAAAAAA", http.StatusNotFound, "No such file")
+	check("malformed", "not-an-id", http.StatusNotFound, "No such file")
+
+	dl, err := e.store.Open(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("busy", id, http.StatusConflict, "being downloaded right now")
+	dl.Finish(context.Background(), true)
+	check("used up", id, http.StatusGone, "no downloads left")
+}
+
+func TestDownloadQueryValidation(t *testing.T) {
+	e := setup(t, big)
+	id := e.upload("a.txt", "downloads=-1", []byte("hello"))
+	for _, q := range []string{"?Raw", "?raw&raw", "?raw&x=1", "?download=1"} {
+		if got := status(t, e.fetch(id+q)); got != http.StatusBadRequest {
+			t.Errorf("%s: %d, want 400", q, got)
+		}
+	}
+	if got := status(t, e.fetch(id+"?raw=1")); got != http.StatusOK {
+		t.Errorf("?raw=1: %d, want 200", got)
+	}
+}
+
+// The CSP must allow exactly the script and style the page contains, or the
+// browser would block the download from starting.
+func TestPageHeaders(t *testing.T) {
+	e := setup(t, big)
+	id := e.upload("a.txt", "", []byte("hello"))
+	resp := e.page(id)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	h := resp.Header
+	for k, want := range map[string]string{
+		"Content-Type":           "text/html; charset=utf-8",
+		"Cache-Control":          "no-store",
+		"Referrer-Policy":        "no-referrer",
+		"X-Content-Type-Options": "nosniff",
+		"X-Robots-Tag":           "noindex, nofollow",
+	} {
+		if h.Get(k) != want {
+			t.Errorf("%s = %q, want %q", k, h.Get(k), want)
+		}
+	}
+	csp := h.Get("Content-Security-Policy")
+	for _, tag := range []string{"script", "style"} {
+		m := regexp.MustCompile(`(?s)<` + tag + `>(.*?)</` + tag + `>`).FindSubmatch(body)
+		if m == nil {
+			t.Fatalf("no <%s> in page", tag)
+		}
+		sum := sha256.Sum256(m[1])
+		want := tag + "-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
+		if !strings.Contains(csp, want) {
+			t.Errorf("CSP %q doesn't allow the page's %s (want %q)", csp, tag, want)
 		}
 	}
 }
