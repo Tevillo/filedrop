@@ -137,6 +137,51 @@ func (d *DB) MarkReady(ctx context.Context, id string) error {
 	return nil
 }
 
+// ActiveFile is a file that can still be downloaded, as shown in a key's
+// status.
+type ActiveFile struct {
+	SizeBytes          int64
+	ExpiresAt          time.Time
+	RemainingDownloads int64 // Unlimited (-1) means no limit
+}
+
+// ActiveFiles returns apiKeyID's ready files that haven't expired or been
+// used up, soonest-expiring first. Expired and used-up files stay in the
+// table until the next sweep; they're left out here.
+func (d *DB) ActiveFiles(ctx context.Context, apiKeyID int64, now time.Time) ([]ActiveFile, error) {
+	rows, err := d.QueryContext(ctx, `
+		SELECT size_bytes, expires_at, remaining_downloads FROM files
+		WHERE api_key_id = ? AND status = 'ready' AND expires_at > ? AND remaining_downloads != 0
+		ORDER BY expires_at, created_at`, apiKeyID, now.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("active files: %w", err)
+	}
+	defer rows.Close()
+	files := []ActiveFile{}
+	for rows.Next() {
+		var f ActiveFile
+		var expires int64
+		if err := rows.Scan(&f.SizeBytes, &expires, &f.RemainingDownloads); err != nil {
+			return nil, fmt.Errorf("active files: %w", err)
+		}
+		f.ExpiresAt = time.Unix(expires, 0)
+		files = append(files, f)
+	}
+	return files, rows.Err()
+}
+
+// ReservedBytes is the storage counted against the total limit: every
+// pending and ready file, for all keys. CreatePendingFile uses the same sum.
+func (d *DB) ReservedBytes(ctx context.Context) (int64, error) {
+	var n int64
+	err := d.QueryRowContext(ctx,
+		`SELECT coalesce(sum(size_bytes), 0) FROM files WHERE status IN ('pending', 'ready')`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("reserved bytes: %w", err)
+	}
+	return n, nil
+}
+
 // GetFile returns a file in any status, or ErrNotFound.
 func (d *DB) GetFile(ctx context.Context, id string) (File, error) {
 	f, err := scanFile(d.QueryRowContext(ctx, `SELECT `+fileColumns+` FROM files WHERE id = ?`, id))

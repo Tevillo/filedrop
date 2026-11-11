@@ -3,6 +3,7 @@
 //	PUT /filedrop/{name}   upload (API key required); the body is the file
 //	GET /filedrop/{id}     share link: a small page whose script starts the download
 //	GET /filedrop/{id}?raw the file itself (no key needed; uses up a download)
+//	GET /filedrop/api/status  the key's downloadable files and storage, as JSON
 //
 // Uploads are the raw request body, so Content-Length is the declared size
 // used to reserve storage before any byte is read.
@@ -11,6 +12,7 @@ package httpapi
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -64,6 +66,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /filedrop/{name}", s.upload)
 	mux.HandleFunc("GET /filedrop/{id}", s.download)
+	mux.HandleFunc("GET /filedrop/api/status", s.status)
 	return s.logRequests(mux)
 }
 
@@ -235,6 +238,60 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "%s/%s\n", s.publicURL, id)
 }
 
+// ---- status ----
+
+type statusResponse struct {
+	Storage struct {
+		UsedBytes             int64 `json:"used_bytes"`
+		ServiceLimitBytes     int64 `json:"service_limit_bytes"`
+		ServiceRemainingBytes int64 `json:"service_remaining_bytes"`
+	} `json:"storage"`
+	Files struct {
+		Count int          `json:"count"`
+		Items []statusItem `json:"items"`
+	} `json:"files"`
+}
+
+type statusItem struct {
+	SizeBytes        int64  `json:"size_bytes"`
+	ExpiresInSeconds int64  `json:"expires_in_seconds"`
+	DownloadsLeft    *int64 `json:"downloads_left"` // null means unlimited
+}
+
+// status reports the calling key's downloadable files (anonymously: no IDs
+// or names) and the service's remaining storage.
+func (s *Server) status(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.authenticate(r)
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="filedrop"`)
+		fail(w, http.StatusUnauthorized, "missing, unknown or revoked API key")
+		return
+	}
+	st, err := s.store.Status(r.Context(), key.ID)
+	if err != nil {
+		s.log.Error("status failed", "key", key.Name, "err", err)
+		fail(w, http.StatusInternalServerError, "could not read status")
+		return
+	}
+	var resp statusResponse
+	resp.Storage.UsedBytes = st.UsedBytes
+	resp.Storage.ServiceLimitBytes = st.LimitBytes
+	resp.Storage.ServiceRemainingBytes = st.RemainingBytes
+	resp.Files.Count = len(st.Files)
+	resp.Files.Items = make([]statusItem, 0, len(st.Files))
+	for _, f := range st.Files {
+		item := statusItem{SizeBytes: f.SizeBytes, ExpiresInSeconds: int64(f.ExpiresIn / time.Second)}
+		if f.DownloadsLeft != db.Unlimited {
+			n := f.DownloadsLeft
+			item.DownloadsLeft = &n
+		}
+		resp.Files.Items = append(resp.Files.Items, item)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(resp)
+}
+
 // stallReader cuts off an upload that makes no progress for timeout. Each
 // read pushes the connection's read deadline forward, so a large but steady
 // upload can take as long as it needs.
@@ -313,7 +370,10 @@ var pageCSP = func() string {
 }()
 
 // The page never contains the file name: preview bots read the page, and the
-// title and text would end up in the chat app's preview.
+// title and text would end up in the chat app's preview. The Open Graph tags
+// give chat apps a generic preview card; error pages get none, so a dead link
+// doesn't advertise a download. There's no og:url, which would repeat the
+// secret link.
 var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -321,7 +381,11 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>File download</title>
-<style>{{.Style}}</style>
+{{if .Start}}<meta property="og:type" content="website">
+<meta property="og:site_name" content="filedrop">
+<meta property="og:title" content="Download file here!">
+<meta property="og:description" content="A file was shared with you.">
+{{end}}<style>{{.Style}}</style>
 </head>
 <body>
 <p id="msg">{{.Message}}</p>

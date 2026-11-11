@@ -186,6 +186,51 @@ type Download struct {
 	dataKey []byte
 }
 
+// KeyStatus summarizes one API key's downloadable files and the service's
+// storage.
+type KeyStatus struct {
+	Files          []StatusFile // soonest-expiring first
+	UsedBytes      int64        // total size of Files
+	LimitBytes     int64        // service-wide total limit
+	RemainingBytes int64        // service-wide space left for uploads
+}
+
+// StatusFile is one downloadable file, without anything identifying it.
+type StatusFile struct {
+	SizeBytes     int64
+	ExpiresIn     time.Duration
+	DownloadsLeft int64 // db.Unlimited (-1) means no limit
+}
+
+// Status reports apiKeyID's files that can still be downloaded, and how much
+// storage the whole service has left.
+func (s *Store) Status(ctx context.Context, apiKeyID int64) (KeyStatus, error) {
+	now := s.now()
+	active, err := s.db.ActiveFiles(ctx, apiKeyID, now)
+	if err != nil {
+		return KeyStatus{}, err
+	}
+	reserved, err := s.db.ReservedBytes(ctx)
+	if err != nil {
+		return KeyStatus{}, err
+	}
+	st := KeyStatus{
+		Files:      make([]StatusFile, 0, len(active)),
+		LimitBytes: s.limits.MaxTotalBytes,
+		// Can go below zero if the limit was lowered after files were stored.
+		RemainingBytes: max(s.limits.MaxTotalBytes-reserved, 0),
+	}
+	for _, f := range active {
+		st.UsedBytes += f.SizeBytes
+		st.Files = append(st.Files, StatusFile{
+			SizeBytes:     f.SizeBytes,
+			ExpiresIn:     f.ExpiresAt.Sub(now),
+			DownloadsLeft: f.RemainingDownloads,
+		})
+	}
+	return st, nil
+}
+
 // Check reports whether id could be downloaded right now without taking a
 // slot: nil, or one of the errors Open would return.
 func (s *Store) Check(ctx context.Context, id string) error {

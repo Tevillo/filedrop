@@ -93,7 +93,7 @@ https://example.com/filedrop/lLwqZ6_kBjVaTSUo0ww8mA
 
 | Setting | Values | Default |
 | --- | --- | --- |
-| `expires` | Go duration from `1s` to `24h`, e.g. `30m`, `2h` | `24h` |
+| `expires` | Go duration from `1s` to `48h`, e.g. `30m`, `2h` | `48h` |
 | `downloads` | `-1` (unlimited) or at least `1` | `1` |
 
 Any other setting name is rejected, so a typo like `expire=2h` fails instead of
@@ -128,16 +128,52 @@ HTML page. Any other query (`?Raw`, `?raw&x=1`) is rejected with `400`.
 
 **Link previews:** chat apps (Discord, Slack, iMessage…) fetch pasted links to
 build a preview. They get the page, which uses nothing up, and they don't run
-its script, so they never reach `?raw`. Link scanners that *do* run JavaScript
+its script, so they never reach `?raw`. A working link shows a generic card
+("Download file here!" / "A file was shared with you.") with no file details;
+a dead link shows no card. Link scanners that *do* run JavaScript
 (some email and antivirus scanners) can still use up a download; allow more
 than one download if a link goes through one.
+
+### Status
+
+See your key's files and the service's storage:
+
+```sh
+curl -sS -H "Authorization: Bearer $KEY" https://example.com/filedrop/api/status
+```
+
+```json
+{
+  "storage": {
+    "used_bytes": 8568,
+    "service_limit_bytes": 10737418240,
+    "service_remaining_bytes": 10737409672
+  },
+  "files": {
+    "count": 2,
+    "items": [
+      {"size_bytes": 2856, "expires_in_seconds": 3540, "downloads_left": 1},
+      {"size_bytes": 5712, "expires_in_seconds": 172000, "downloads_left": null}
+    ]
+  }
+}
+```
+
+- Lists only files uploaded with **your** key that can still be downloaded:
+  not expired, not used up. Soonest-expiring first.
+- Entries are anonymous on purpose: no link, ID or name.
+- `downloads_left: null` means unlimited.
+- `used_bytes` is the total of the listed files. `service_remaining_bytes` is
+  what a new upload can use, across all keys; it also counts uploads in
+  progress and used-up files until the next cleanup sweep (at most
+  `FILEDROP_SWEEP_INTERVAL`).
 
 ### Responses
 
 | Status | Meaning |
 | --- | --- |
 | `201` | Uploaded; the body is the share link |
-| `200` | Download page, or the file itself with `?raw` |
+| `200` | Download page, the file itself with `?raw`, or status JSON |
 | `400` | Invalid setting, file name or download query, or the upload didn't complete |
 | `401` | Missing, unknown or revoked API key |
 | `404` | No such file (or no file name in the upload URL) |

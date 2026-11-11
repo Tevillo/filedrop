@@ -6,14 +6,15 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"regexp"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -155,7 +156,7 @@ func TestRoundTrip(t *testing.T) {
 	e := setup(t, big)
 	data := randomBytes(300_000)
 	name := "my photo ü.jpg"
-	id := e.upload(name, "", data) // defaults: 24h, 1 download
+	id := e.upload(name, "", data) // defaults: store.MaxTTL (48h), 1 download
 
 	resp := e.get(id)
 	got, err := io.ReadAll(resp.Body)
@@ -248,7 +249,7 @@ func TestUploadRejections(t *testing.T) {
 		{"wrong key", "a.txt", "", "fd_nope", small, 401},
 		{"revoked key", "a.txt", "", revoked, small, 401},
 		{"too large", "a.txt", "", e.key, randomBytes(1001), 413},
-		{"expires too long", "a.txt", "expires=25h", e.key, small, 400},
+		{"expires too long", "a.txt", "expires=" + (store.MaxTTL + time.Hour).String(), e.key, small, 400},
 		{"expires not a duration", "a.txt", "expires=tomorrow", e.key, small, 400},
 		{"zero downloads", "a.txt", "downloads=0", e.key, small, 400},
 		{"downloads below -1", "a.txt", "downloads=-2", e.key, small, 400},
@@ -509,5 +510,149 @@ func TestPageHeaders(t *testing.T) {
 		if !strings.Contains(csp, want) {
 			t.Errorf("CSP %q doesn't allow the page's %s (want %q)", csp, tag, want)
 		}
+	}
+}
+
+// Chat apps get a generic preview card for a working link, and none for a
+// dead one.
+func TestPreviewCardTags(t *testing.T) {
+	e := setup(t, big)
+	id := e.upload("a.txt", "downloads=1", []byte("hello"))
+	tags := []string{
+		`<meta property="og:title" content="Download file here!">`,
+		`<meta property="og:description" content="A file was shared with you.">`,
+		`<meta property="og:site_name" content="filedrop">`,
+	}
+	body := func() string {
+		resp := e.page(id)
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return string(b)
+	}
+
+	page := body()
+	for _, tag := range tags {
+		if !strings.Contains(page, tag) {
+			t.Errorf("working page missing %s", tag)
+		}
+	}
+	if strings.Contains(page, "og:url") {
+		t.Error("page has og:url, which would repeat the secret link")
+	}
+
+	status(t, e.get(id)) // use up the only download
+	if page := body(); strings.Contains(page, "og:") {
+		t.Errorf("dead link still has preview tags:\n%s", page)
+	}
+}
+
+func (e *env) status(key string) (*http.Response, statusResponse) {
+	e.t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, e.ts.URL+"/filedrop/api/status", nil)
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body statusResponse
+	if resp.StatusCode == http.StatusOK {
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+	return resp, body
+}
+
+func TestStatus(t *testing.T) {
+	e := setup(t, big)
+	ctx := context.Background()
+
+	// Nothing uploaded yet: empty list, not null.
+	resp, st := e.status(e.key)
+	if resp.StatusCode != http.StatusOK || st.Files.Count != 0 || st.Files.Items == nil {
+		t.Fatalf("empty status: %d %+v", resp.StatusCode, st)
+	}
+	if resp.Header.Get("Content-Type") != "application/json" || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("headers: %v", resp.Header)
+	}
+
+	later := e.upload("later.txt", "expires=10h&downloads=-1", randomBytes(300)) // unlimited
+	e.upload("soon.txt", "expires=1h&downloads=3", randomBytes(100))
+	used := e.upload("used.txt", "downloads=1", randomBytes(50))
+	expired := e.upload("expired.txt", "downloads=1", randomBytes(70))
+	status(t, e.get(used)) // used up, but not swept yet
+	if _, err := e.db.ExecContext(ctx, `UPDATE files SET created_at = ?, expires_at = ? WHERE id = ?`,
+		time.Now().Add(-2*time.Hour).Unix(), time.Now().Add(-time.Minute).Unix(), expired); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another key's file is not shown, but does use service storage.
+	other, _ := apikey.Generate()
+	if _, err := e.db.CreateAPIKey(ctx, "other", apikey.Hash(other), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if resp := e.put("theirs.txt", "", other, randomBytes(1000)); status(t, resp) != http.StatusCreated {
+		t.Fatal("other key's upload failed")
+	}
+
+	resp, st = e.status(e.key)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	if st.Files.Count != 2 || len(st.Files.Items) != 2 {
+		t.Fatalf("want 2 files (used-up, expired and other key's left out), got %+v", st.Files)
+	}
+	soon, late := st.Files.Items[0], st.Files.Items[1]
+	if soon.SizeBytes != 100 || soon.DownloadsLeft == nil || *soon.DownloadsLeft != 3 ||
+		soon.ExpiresInSeconds <= 3500 || soon.ExpiresInSeconds > 3600 {
+		t.Errorf("first item should be the 1h file: %+v", soon)
+	}
+	if late.SizeBytes != 300 || late.DownloadsLeft != nil || late.ExpiresInSeconds <= 9*3600 {
+		t.Errorf("second item should be the unlimited 10h file: %+v", late)
+	}
+	if st.Storage.UsedBytes != 400 {
+		t.Errorf("used_bytes = %d, want 400", st.Storage.UsedBytes)
+	}
+	// Remaining matches the upload check: every reserved byte, all keys,
+	// including files waiting for the sweep.
+	reserved := int64(300 + 100 + 50 + 70 + 1000)
+	if st.Storage.ServiceLimitBytes != big.MaxTotalBytes ||
+		st.Storage.ServiceRemainingBytes != big.MaxTotalBytes-reserved {
+		t.Errorf("storage = %+v, want limit %d remaining %d", st.Storage, big.MaxTotalBytes, big.MaxTotalBytes-reserved)
+	}
+
+	// Unlimited downloads show as JSON null, and nothing identifies a file.
+	req, _ := http.NewRequest(http.MethodGet, e.ts.URL+"/filedrop/api/status", nil)
+	req.Header.Set("Authorization", "Bearer "+e.key)
+	r2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(r2.Body)
+	r2.Body.Close()
+	if !strings.Contains(string(raw), `"downloads_left":null`) {
+		t.Errorf("unlimited isn't null: %s", raw)
+	}
+	if strings.Contains(string(raw), later) || strings.Contains(string(raw), "later.txt") {
+		t.Errorf("status identifies a file: %s", raw)
+	}
+}
+
+func TestStatusAuth(t *testing.T) {
+	e := setup(t, big)
+	if resp, _ := e.status(""); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("no key: %d, want 401", resp.StatusCode)
+	}
+	if resp, _ := e.status("fd_wrong"); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("wrong key: %d, want 401", resp.StatusCode)
+	}
+	if _, err := e.db.RevokeAPIKey(context.Background(), "test"); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := e.status(e.key); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("revoked key: %d, want 401", resp.StatusCode)
 	}
 }
